@@ -59,14 +59,14 @@ void showHelpAndExit()
 {
   blk("                                                                ");
   blu("=============================================================== ");
-  blu("Usage: uFldXboxJoystick file.moos [OPTIONS]                      ");
+  blu("Usage: uXboxJoystick file.moos [OPTIONS]                      ");
   blu("=============================================================== ");
   blk("                                                                ");
   showSynopsis();
   blk("                                                                ");
   blk("Options:                                                        ");
   mag("  --alias","=<ProcessName>                                      ");
-  blk("      Launch uFldXboxJoystick with the given process name.      ");
+  blk("      Launch uXboxJoystick with the given process name.      ");
   mag("  --example, -e                                                 ");
   blk("      Display example MOOS configuration block.                 ");
   mag("  --help, -h                                                    ");
@@ -74,7 +74,7 @@ void showHelpAndExit()
   mag("  --interface, -i                                               ");
   blk("      Display MOOS publications and subscriptions.              ");
   mag("  --version,-v                                                  ");
-  blk("      Display release version of uFldXboxJoystick.              ");
+  blk("      Display release version of uXboxJoystick.              ");
   blk("                                                                ");
   exit(0);
 }
@@ -86,10 +86,10 @@ void showExampleConfigAndExit()
 {
   blk("                                                                ");
   blu("=============================================================== ");
-  blu("uFldXboxJoystick Example MOOS Configuration                      ");
+  blu("uXboxJoystick Example MOOS Configuration                      ");
   blu("=============================================================== ");
   blk("                                                                ");
-  blk("ProcessConfig = uFldXboxJoystick                                ");
+  blk("ProcessConfig = uXboxJoystick                                ");
   blk("{                                                               ");
   blk("  AppTick   = 25   // command stream rate; 10-25 feels smooth   ");
   blk("  CommsTick = 25                                                ");
@@ -169,7 +169,7 @@ void showInterfaceAndExit()
 {
   blk("                                                                ");
   blu("=============================================================== ");
-  blu("uFldXboxJoystick INTERFACE                                       ");
+  blu("uXboxJoystick INTERFACE                                       ");
   blu("=============================================================== ");
   blk("                                                                ");
   blk("SUBSCRIPTIONS:                                                  ");
@@ -220,6 +220,6 @@ void showInterfaceAndExit()
 
 void showReleaseInfoAndExit()
 {
-  showReleaseInfo("uFldXboxJoystick", "gpl");
+  showReleaseInfo("uXboxJoystick", "gpl");
   exit(0);
 }

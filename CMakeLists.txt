@@ -1,5 +1,5 @@
 #--------------------------------------------------------
-# The CMakeLists.txt for: uFldXboxJoystick
+# The CMakeLists.txt for: uXboxJoystick
 # Author(s): Tyler Errico
 #--------------------------------------------------------
 
