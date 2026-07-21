@@ -18,6 +18,8 @@
 /*    RB -> cycle which vehicle the RIGHT stick controls         */
 /*    X  -> toggle LEFT stick control frame (body <-> global)    */
 /*    A  -> toggle RIGHT stick control frame (body <-> global)   */
+/*    Y  -> dispatch LEFT stick's boat to auto-untag (toggle)    */
+/*    B  -> dispatch RIGHT stick's boat to auto-untag (toggle)   */
 /*    LT -> proportional brake/reverse, LEFT stick's boat        */
 /*    RT -> proportional brake/reverse, RIGHT stick's boat       */
 /*  (Bumpers switch boats -- index fingers, thumbs never leave   */
@@ -32,6 +34,24 @@
 /*  trigger with the stick centered is straight-line reverse.    */
 /*  Release the trigger and thrust reverts to the stick. Works   */
 /*  identically in both frames.                                  */
+/*                                                               */
+/*  UNTAG DISPATCH (Y / B)                                       */
+/*  ----------------------                                       */
+/*  Pressing Y (left) / B (right) on a TAGGED boat delegates it  */
+/*  back to its helm to untag autonomously: zero-post + override */
+/*  drop, but the hold-mode REDIR_CONTROLLED latch stays on, so  */
+/*  the helm wakes into MODE==TAGGED and waypt_untag (ungated by */
+/*  design) drives it home while the REDIR gate keeps all game   */
+/*  behaviors off. The app watches the tag and RE-ACQUIRES the   */
+/*  instant it clears -- the stick gets the boat back at the     */
+/*  home flag automatically. Press again mid-return to reclaim   */
+/*  immediately. While dispatched: no commands, no override      */
+/*  re-assert (they would strand the boat by silencing the       */
+/*  helm), triangle and gauge clear, ring stays (ownership),     */
+/*  appcast frame column reads UNTAG, and a small HELM(L/R)      */
+/*  text tag follows the boat on the viewer (a VIEW_POINT with   */
+/*  an invisible vertex whose LABEL is the text -- works on any  */
+/*  viewer build, since labels render by default).               */
 /*                                                               */
 /*  MASTER ACTIVE TOGGLE                                         */
 /*  --------------------                                         */
@@ -69,7 +89,10 @@
 /*  control systems read consistently on the viewer while        */
 /*  remaining distinguishable by color. Rings are labeled per-   */
 /*  STICK (xbox_left / xbox_right) so cycling vehicles just      */
-/*  moves the ring. Tagged boats lose the ring while tagged      */
+/*  moves the ring, and a plain L / R text tag above the ring    */
+/*  names which stick owns the boat (swapping to HELM(L/R)       */
+/*  during an untag dispatch, so the text always names who is    */
+/*  actually in control). Tagged boats lose the ring while tagged*/
 /*  (matching the redirect-halo convention; the tag manager's    */
 /*  own circle shows instead). Clears are FULL circle specs with */
 /*  active=false -- some pMarineViewer builds reject label-only  */
@@ -92,7 +115,7 @@
 /*  draws a faint wash, full deflection a solid arrowhead.       */
 /*  Inside the deadzone there is no commanded direction, so the  */
 /*  triangle CLEARS rather than pointing somewhere stale; ditto  */
-/*  when tag-suppressed or when the needed NODE_REPORT data      */
+/*  when untag-dispatched or when the needed NODE_REPORT data    */
 /*  (position; heading too in body frame) is not yet known.      */
 /*                                                               */
 /*  BRAKE GAUGE (VIEW_POLYGON pair)                              */
@@ -101,9 +124,10 @@
 /*  visible ONLY while that stick's trigger is pulled past its   */
 /*  deadzone -- zero standing clutter. Two rectangles: a fixed   */
 /*  outline in the stick's color (identity) and a red fill that  */
-/*  rises bottom-up with pull depth (brake semantics). Follows   */
-/*  the boat and clears under the same conditions as the other   */
-/*  graphics.                                                    */
+/*  rises bottom-up with pull depth (brake semantics), plus a    */
+/*  small REV(L/R) text tag under the bar so the gauge is self-  */
+/*  explanatory. Follows the boat and clears under the same      */
+/*  conditions as the other graphics.                            */
 /*                                                               */
 /*  The app also publishes XBOX_CONTROL_STATUS on every state    */
 /*  change (activation, cycle, frame toggle), e.g.:              */
@@ -179,6 +203,20 @@
 /*    RELEASE: zero thrust/rudder + override=false; the helm     */
 /*      resumes whatever its behavior conditions dictate.        */
 /*                                                               */
+/*  ROSTER PARKING (park_unselected, hold mode only)             */
+/*  ------------------------------------------------             */
+/*  On activation the REDIR gate is latched on EVERY rostered    */
+/*  vehicle, not just the two the sticks hold: unselected boats  */
+/*  station_hold (do nothing) instead of playing the game. A     */
+/*  tagged parked boat still recovers autonomously -- the TAGGED */
+/*  interlock stands station_hold down, waypt_untag drives it to */
+/*  the untag zone with game behaviors gated the whole way, then */
+/*  station_hold re-captures. The latch survives deactivation    */
+/*  (the roster is handed back PARKED); boats rejoin game play   */
+/*  only via the pRedirectWaypoint b/r + w workflow. Since       */
+/*  station_hold (140) outbids waypt_return_home (100), the      */
+/*  viewer RETURN button does not move parked boats.             */
+/*                                                               */
 /*  COEXISTENCE NOTE: if pRedirectWaypoint toggles team control  */
 /*  (w) while the Xbox holds a boat of the OTHER team parked in  */
 /*  hold mode, its recomputeControl() will post                  */
@@ -207,9 +245,8 @@
 /*    one zero thrust/rudder post + override drop. Not           */
 /*    configurable -- no config can leave a boat dead-stick or   */
 /*    frozen under a stale override.                             */
-/*  * respect_tags: a tagged (disabled) boat receives zero       */
-/*    commands while tagged -- manual override must not become a */
-/*    way to drive through the game's tag rules.                 */
+/*  * Tagged boats remain FULLY controllable (game legality is   */
+/*    the operator's call); the appcast marks them (T).          */
 /*  * Cycling skips the vehicle currently owned by the OTHER     */
 /*    stick, so two sticks can never fight over one boat.        */
 /*****************************************************************/
@@ -257,15 +294,22 @@ protected: // Control logic
     double brake;          // trigger pull, [0,1] (0 = released)
     int    vix;            // index into m_vehicles, -1 = unassigned
     bool   global_frame;   // false = body frame
+    bool   untag_dispatch; // boat delegated to helm for auto-untag
+    bool   tri_drawn;      // transition-tracked so clears post ONCE,
+    bool   bar_drawn;      //   not per-tick (per-tick clear churn
+    bool   tag_drawn;      //   floods VIEW_* and drowns scoping)
     double out_thrust;     // last computed command (for appcast)
     double out_rudder;
     Stick() : x(0), y(0), brake(0), vix(-1), global_frame(false),
+              untag_dispatch(false), tri_drawn(false),
+              bar_drawn(false), tag_drawn(false),
               out_thrust(0), out_rudder(0) {}
   };
 
   void   cycleVehicle(StickID sid);       // X / A press
   void   toggleFrame(StickID sid);        // LB / RB press
   void   setActive(bool active);          // START press (master toggle)
+  void   dispatchUntag(StickID sid);      // Y / B press (see above)
   void   computeAndPost(StickID sid);     // one stick -> one boat
   void   releaseVehicle(int vix);         // zero + optional helm handback
   void   acquireVehicle(int vix);         // manual override on (if active)
@@ -286,19 +330,31 @@ protected: // Control logic
   void   postBrakeBar(StickID sid);
   void   clearBrakeBar(StickID sid);
 
+  // "Under helm control" text tag (VIEW_POINT with invisible
+  // vertex; the label IS the text). Shown while untag-dispatched.
+  void   postHelmText(StickID sid);
+  void   clearHelmText(StickID sid);
+
+  // Stick-identity text tag: a plain L / R above the ring while
+  // the stick is actively driving the boat (swaps with the HELM
+  // tag during an untag dispatch). Same invisible-vertex trick.
+  void   postStickTag(StickID sid);
+  void   clearStickTag(StickID sid);
+
   // Publish XBOX_CONTROL_STATUS. Called on any state change.
   void   postStatus();
+
 
   // NODE_REPORT ingestion: cache heading per vehicle for the
   // global-frame P-controller, and x/y for ring placement.
   void   handleNodeReport(const std::string& sval);
 
   // TAGGED_VEHICLES / TAGGED_<VNAME> ingestion (same sources as
-  // pRedirectWaypoint): tagged boats lose their control ring and,
-  // if respect_tags, receive zero commands while tagged.
+  // pRedirectWaypoint). Tag state drives the (T) appcast marker,
+  // validates Y/B dispatch, and triggers auto-reacquire when a
+  // dispatched boat's tag clears.
   void   handleTaggedVehicles(const std::string& csv);
   void   handleTagged(const std::string& vname, bool tagged);
-
   // Debug circular buffer (house style, cf. pRedirectWaypoint).
   void   debugLog(const std::string& line);
 
@@ -315,8 +371,8 @@ private: // Configuration (mission-portable knobs)
   bool         m_active_at_start;        // launch already in teleop?
   bool         m_handback_hold;          // true=hold (REDIR park),
                                          // false=autonomy (no REDIR)
-  bool         m_respect_tags;           // zero cmds to tagged boats
-
+  bool         m_park_unselected;        // hold mode: REDIR-latch the
+                                         // whole roster on activation
   // Ring appearance.
   double       m_ring_radius;
   std::string  m_left_ring_color;
@@ -337,10 +393,12 @@ private: // Configuration (mission-portable knobs)
   unsigned int m_ax_left_x,  m_ax_left_y;
   unsigned int m_ax_right_x, m_ax_right_y;
   unsigned int m_ax_left_trig, m_ax_right_trig;   // LT / RT
-  unsigned int m_btn_cycle_left;    // X = 2
-  unsigned int m_btn_cycle_right;   // A = 0
-  unsigned int m_btn_frame_left;    // LB = 4
-  unsigned int m_btn_frame_right;   // RB = 5
+  unsigned int m_btn_cycle_left;    // LB = 4  (cycle left-stick boat)
+  unsigned int m_btn_cycle_right;   // RB = 5  (cycle right-stick boat)
+  unsigned int m_btn_frame_left;    // X  = 2  (toggle left frame)
+  unsigned int m_btn_frame_right;   // A  = 0  (toggle right frame)
+  unsigned int m_btn_untag_left;    // Y  = 3  (auto-untag left boat)
+  unsigned int m_btn_untag_right;   // B  = 1  (auto-untag right boat)
   unsigned int m_btn_active;        // START = 7
 
 private: // Live state
@@ -356,11 +414,9 @@ private: // Live state
   std::map<std::string, double> m_heading;
   std::map<std::string, double> m_vx;
   std::map<std::string, double> m_vy;
-
   // Tagged (disabled) boats, lowercase vnames. Fed by
   // TAGGED_VEHICLES (authoritative csv) and TAGGED_<VNAME> edges.
   std::set<std::string> m_tagged;
-
   // Debug circular buffer (house style).
   bool                    m_debug;
   std::list<std::string>  m_debug_buffer;

@@ -39,7 +39,8 @@ XboxJoystick::XboxJoystick()
   m_active_at_start  = false;   // SAFE default: autonomy until START
   m_handback_hold    = true;    // hold: park via REDIR_CONTROLLED
                                 // (needs click-to-redirect bhv patches)
-  m_respect_tags     = true;    // tagged boat = zero commands
+  m_park_unselected  = true;    // hold mode: latch the WHOLE roster,
+                                // so unselected boats hold, not play
 
   m_ring_radius      = 10;
   m_left_ring_color  = "green";
@@ -66,6 +67,8 @@ XboxJoystick::XboxJoystick()
   m_btn_cycle_right = 5;   // RB
   m_btn_frame_left  = 2;   // X   (face buttons switch frames)
   m_btn_frame_right = 0;   // A
+  m_btn_untag_left  = 3;   // Y   (dispatch auto-untag return)
+  m_btn_untag_right = 1;   // B
   m_btn_active      = 7;   // START
 
   m_jsfd       = -1;
@@ -161,6 +164,29 @@ bool XboxJoystick::Iterate()
   // the helms own their boats. Rings are refreshed here too so
   // they track the boats at AppTick rate.
   if(m_active) {
+    // Untag-dispatch watcher: a dispatched boat is with its helm
+    // running waypt_untag. The moment its tag clears, snap the
+    // override back on -- the stick regains the boat without it
+    // ever reaching a game behavior (the REDIR gate held those
+    // off the whole return, hold mode).
+    for(int i=0; i<2; i++) {
+      Stick &stk = m_stick[i];
+      if(!stk.untag_dispatch)
+        continue;
+      string vname = vehicleName(stk.vix);
+      if(vname == "") {
+        stk.untag_dispatch = false;
+        continue;
+      }
+      if(m_tagged.count(tolower(vname)) == 0) {
+        stk.untag_dispatch = false;
+        clearHelmText((StickID)i);
+        acquireVehicle(stk.vix);
+        debugLog("Untag complete -- reclaimed " + vname);
+        postStatus();
+      }
+    }
+
     computeAndPost(LEFT_STICK);
     computeAndPost(RIGHT_STICK);
     postRing(LEFT_STICK);
@@ -169,6 +195,10 @@ bool XboxJoystick::Iterate()
     postDirTriangle(RIGHT_STICK);
     postBrakeBar(LEFT_STICK);
     postBrakeBar(RIGHT_STICK);
+    postHelmText(LEFT_STICK);     // no-ops unless untag-dispatched
+    postHelmText(RIGHT_STICK);
+    postStickTag(LEFT_STICK);     // L / R while stick-driven
+    postStickTag(RIGHT_STICK);
 
     // Slow (1 Hz) re-assert of the hold-mode handback gate. If
     // pRedirectWaypoint's recomputeControl() fires while we hold a
@@ -179,12 +209,24 @@ bool XboxJoystick::Iterate()
     // small posts per second instead of 50.
     if((MOOSTime() - m_last_gate_assert) > 1.0) {
       if(m_handback_hold) {
-        for(int i=0; i<2; i++) {
-          string vname = vehicleName(m_stick[i].vix);
-          if(vname == "")
-            continue;
-          Notify("REDIR_CONTROLLED_" + toupper(vname), "true");
-          m_posts++;
+        if(m_park_unselected) {
+          // Roster-wide: parked boats need the latch defended
+          // from pRedirectWaypoint recompute stomps just as much
+          // as driven ones.
+          for(unsigned int v=0; v<m_vehicles.size(); v++) {
+            Notify("REDIR_CONTROLLED_" + toupper(m_vehicles[v]),
+                   "true");
+            m_posts++;
+          }
+        }
+        else {
+          for(int i=0; i<2; i++) {
+            string vname = vehicleName(m_stick[i].vix);
+            if(vname == "")
+              continue;
+            Notify("REDIR_CONTROLLED_" + toupper(vname), "true");
+            m_posts++;
+          }
         }
       }
       m_last_gate_assert = MOOSTime();
@@ -246,8 +288,8 @@ bool XboxJoystick::OnStartUp()
       else if(lval == "autonomy") {
         m_handback_hold = false; handled = true; }
     }
-    else if(param == "respect_tags")
-      handled = setBooleanOnString(m_respect_tags, value);
+    else if(param == "park_unselected")
+      handled = setBooleanOnString(m_park_unselected, value);
     else if(param == "debug")
       handled = setBooleanOnString(m_debug, value);
     else if(param == "ring_radius")
@@ -308,6 +350,10 @@ bool XboxJoystick::OnStartUp()
       handled = setUIntOnString(m_btn_frame_left, value);
     else if(param == "button_frame_right")
       handled = setUIntOnString(m_btn_frame_right, value);
+    else if(param == "button_untag_left")
+      handled = setUIntOnString(m_btn_untag_left, value);
+    else if(param == "button_untag_right")
+      handled = setUIntOnString(m_btn_untag_right, value);
     else if(param == "button_active")
       handled = setUIntOnString(m_btn_active, value);
 
@@ -334,11 +380,12 @@ bool XboxJoystick::OnStartUp()
 
   // Sanity: identical button assignments would make one physical
   // press fire two logical actions. Config error, warn loudly.
-  unsigned int btns[5] = { m_btn_cycle_left, m_btn_cycle_right,
+  unsigned int btns[7] = { m_btn_cycle_left, m_btn_cycle_right,
                            m_btn_frame_left, m_btn_frame_right,
+                           m_btn_untag_left, m_btn_untag_right,
                            m_btn_active };
-  for(unsigned int i=0; i<5; i++)
-    for(unsigned int j=i+1; j<5; j++)
+  for(unsigned int i=0; i<7; i++)
+    for(unsigned int j=i+1; j<7; j++)
       if(btns[i] == btns[j])
         reportConfigWarning("Two actions share one button index.");
 
@@ -491,6 +538,10 @@ void XboxJoystick::handleButton(unsigned int button, bool pressed)
     toggleFrame(LEFT_STICK);
   else if(button == m_btn_frame_right)
     toggleFrame(RIGHT_STICK);
+  else if(button == m_btn_untag_left)
+    dispatchUntag(LEFT_STICK);
+  else if(button == m_btn_untag_right)
+    dispatchUntag(RIGHT_STICK);
 }
 
 //---------------------------------------------------------------
@@ -519,7 +570,15 @@ void XboxJoystick::cycleVehicle(StickID sid)
     if(cand == cur)
       return;                         // wrapped back: nowhere to go
 
-    releaseVehicle(cur);
+    // A dispatched boat is already with its helm mid-return: no
+    // second release; just drop the claim and let it finish (it
+    // will station_hold after untagging, hold mode).
+    if(m_stick[sid].untag_dispatch) {
+      m_stick[sid].untag_dispatch = false;
+      clearHelmText(sid);
+    }
+    else
+      releaseVehicle(cur);
     m_stick[sid].vix = cand;
     acquireVehicle(cand);
     debugLog(((sid==LEFT_STICK)?string("LEFT"):string("RIGHT")) +
@@ -538,6 +597,62 @@ void XboxJoystick::toggleFrame(StickID sid)
   debugLog(((sid==LEFT_STICK)?string("LEFT"):string("RIGHT")) +
            " frame -> " +
            (m_stick[sid].global_frame ? "global" : "body"));
+  postStatus();
+}
+
+//---------------------------------------------------------------
+// Procedure: dispatchUntag
+//
+// Y / B press: send the selected boat home to untag AUTONOMOUSLY,
+// then automatically get it back.
+//
+// Mechanism -- a temporary delegation built on the handback path:
+// zero-post + drop the override (releaseVehicle), but the hold-
+// mode REDIR_CONTROLLED latch STAYS on (the 1 Hz re-assert keeps
+// it there). The helm wakes into MODE==TAGGED; waypt_untag (the
+// deliberately UNgated behavior) drives the boat home and clears
+// the tag; the REDIR gate keeps every game behavior off the whole
+// way. The Iterate() watcher re-acquires the instant the tag
+// clears, so the stick gets the boat back at the home flag
+// without any operator action.
+//
+// Toggle semantics: pressing again mid-return RECLAIMS the boat
+// immediately (override back on, return abandoned) -- for when
+// the return path is about to cost you tactically.
+//
+// No-ops: inactive teleop, unassigned stick, or boat not tagged.
+
+void XboxJoystick::dispatchUntag(StickID sid)
+{
+  if(!m_active)
+    return;
+
+  Stick &stk = m_stick[sid];
+  string vname = vehicleName(stk.vix);
+  if(vname == "")
+    return;
+
+  if(stk.untag_dispatch) {
+    // Second press: reclaim mid-return.
+    stk.untag_dispatch = false;
+    clearHelmText(sid);
+    acquireVehicle(stk.vix);
+    debugLog("Untag return CANCELED -- reclaimed " + vname);
+    postStatus();
+    return;
+  }
+
+  if(m_tagged.count(tolower(vname)) == 0) {
+    debugLog("Untag ignored -- " + vname + " is not tagged");
+    return;
+  }
+
+  releaseVehicle(stk.vix);        // zero-post + override drop;
+                                  // REDIR latch deliberately kept
+  stk.untag_dispatch = true;
+  clearDirTriangle(sid);
+  clearBrakeBar(sid);
+  debugLog("Untag dispatch -- " + vname + " released to helm");
   postStatus();
 }
 
@@ -572,6 +687,30 @@ void XboxJoystick::setActive(bool active)
   if(active)
     m_active = true;
 
+  // ROSTER PARKING (hold mode): on activation, latch the REDIR
+  // gate on EVERY rostered vehicle, not just the two the sticks
+  // hold. Unselected boats therefore wake out of their game
+  // behaviors into station_hold -- they do NOTHING until a stick
+  // cycles onto them. The interlocks still apply per boat: a
+  // tagged parked boat runs waypt_untag to the untag zone (its
+  // gate keeps game behaviors off the whole way), then re-parks.
+  // The latch is deliberately NOT dropped on deactivation --
+  // "inactive" hands the ROSTER back parked, and boats return to
+  // game play only via the pRedirectWaypoint b/r + w workflow.
+  // Note: station_hold (140) also outbids waypt_return_home
+  // (100), so the viewer RETURN button will not move parked
+  // boats.
+  if(active && m_handback_hold && m_park_unselected) {
+    for(unsigned int v=0; v<m_vehicles.size(); v++) {
+      string uv = toupper(m_vehicles[v]);
+      Notify("REDIR_ACTIVE_" + uv, "false");
+      Notify("REDIR_CONTROLLED_" + uv, "true");
+      m_posts += 2;
+    }
+    debugLog("Roster parked: REDIR latch on " +
+             uintToString(m_vehicles.size()) + " boats");
+  }
+
   for(int i=0; i<2; i++) {
     int vix = m_stick[i].vix;
     if(vehicleName(vix) == "")
@@ -579,7 +718,15 @@ void XboxJoystick::setActive(bool active)
     if(active)
       acquireVehicle(vix);
     else {
-      releaseVehicle(vix);
+      // Dispatched boat: already released to its helm; a second
+      // zero-post would momentarily fight it. Just clear the flag
+      // and let the return finish.
+      if(m_stick[i].untag_dispatch) {
+        m_stick[i].untag_dispatch = false;
+        clearHelmText((StickID)i);
+      }
+      else
+        releaseVehicle(vix);
       m_stick[i].out_thrust = 0;
       m_stick[i].out_rudder = 0;
     }
@@ -593,6 +740,8 @@ void XboxJoystick::setActive(bool active)
     clearDirTriangle(RIGHT_STICK);
     clearBrakeBar(LEFT_STICK);
     clearBrakeBar(RIGHT_STICK);
+    clearStickTag(LEFT_STICK);
+    clearStickTag(RIGHT_STICK);
   }
 
   debugLog(string("Teleop -> ") + (active ? "ACTIVE" : "inactive"));
@@ -643,24 +792,24 @@ void XboxJoystick::computeAndPost(StickID sid)
   if(vname == "")
     return;                           // stick unassigned
 
+  // Untag dispatch: the boat is deliberately with its helm right
+  // now (waypt_untag driving it home). Post NOTHING -- especially
+  // not the tick-rate override re-assert, which would silence the
+  // helm and strand the boat. Iterate() re-acquires when the tag
+  // clears. Tagged boats are otherwise fully controllable; game
+  // legality is the operator's call, not the app's.
+  if(stk.untag_dispatch)
+    return;
+
   double mag = hypot(stk.x, stk.y);
   double thrust = 0;
   double rudder = 0;
-
-  // Tagged boat + respect_tags: force zero commands while tagged.
-  // Manual override bypasses the helm, so without this a tagged
-  // (game-disabled) boat could be driven anyway -- teleop should
-  // not be a loophole in the tag rules. The zero-post stream (not
-  // silence) means the boat sits still rather than holding its
-  // last pre-tag command.
-  bool suppressed = m_respect_tags &&
-                    (m_tagged.count(tolower(vname)) > 0);
 
   bool braking = (stk.brake > m_trigger_deadzone);
   if(mag > 1.0)
     mag = 1.0;                        // diagonal corners exceed 1
 
-  if((mag >= m_deadzone) && !suppressed) {
+  if(mag >= m_deadzone) {
     // ---- Rudder from the stick (both frames), and forward
     // ---- thrust from the stick only when NOT braking.
     double err = 0;
@@ -702,8 +851,8 @@ void XboxJoystick::computeAndPost(StickID sid)
   // ---- Trigger: the exclusive reverse thrust source ----
   // While braking, thrust comes ONLY from the trigger; any stick
   // forward thrust was skipped above, but stick rudder stands, so
-  // the boat steers while backing. Tag suppression still wins.
-  if(braking && !suppressed) {
+  // the boat steers while backing.
+  if(braking) {
     double brake = (stk.brake > 1.0) ? 1.0 : stk.brake;
     thrust = -brake * m_max_thrust;
   }
@@ -764,7 +913,15 @@ void XboxJoystick::acquireVehicle(int vix)
   if(m_handback_hold) {
     Notify("REDIR_ACTIVE_" + uv, "false");
     Notify("REDIR_CONTROLLED_" + uv, "true");
-    m_posts += 2;
+
+    // Raise the graphics mask: the vehicle-side uGfxMask app
+    // erases station_hold's rings while XBOX_DRIVEN is true.
+    // Shoreside erases CANNOT do this job -- pMarineViewer keys
+    // geo shapes per SOURCE community, so only a vehicle-
+    // originated erase lands in the map holding the vehicle-
+    // posted rings (learned across four debugging rounds).
+    Notify("XBOX_DRIVEN_" + uv, "true");
+    m_posts += 3;
   }
   // BOTH spellings, deliberately. pHelmIvP honors either, but
   // some pMarinePID builds only honor the historic one-R
@@ -803,8 +960,38 @@ void XboxJoystick::releaseVehicle(int vix)
   string uv = toupper(vname);
   Notify("DESIRED_THRUST_" + uv, 0.0);
   Notify("DESIRED_RUDDER_" + uv, 0.0);
+
+  // Re-station the boat AT ITS CURRENT POSITION explicitly, via
+  // station_hold's updates channel. center_activate=true only
+  // re-captures on an idle->running edge, and across a manual-
+  // override period the helm never iterates behaviors -- so on a
+  // second (and every later) handback there is NO edge and the
+  // boat would sail back to wherever the FIRST hold captured.
+  // The updates-channel station_pt applies unconditionally.
+  // Skipped if no NODE_REPORT position is known yet; in that
+  // case the boat has never moved under our control and the
+  // original center_activate capture is still correct.
+  if(m_handback_hold) {
+    string lname = tolower(vname);
+    if(m_vx.find(lname) != m_vx.end()) {
+      string spt = "station_pt=" +
+        doubleToStringX(m_vx[lname], 1) + "," +
+        doubleToStringX(m_vy[lname], 1);
+      Notify("REDIR_HOLD_UPDATE_" + uv, spt);
+      m_posts++;
+    }
+  }
+
   Notify("MOOS_MANUAL_OVERRIDE_" + uv, "false");
   Notify("MOOS_MANUAL_OVERIDE_"  + uv, "false");   // both spellings
+  if(m_handback_hold) {
+    // Drop the graphics mask: uGfxMask stops erasing and the
+    // re-engaged station_hold redraws its rings at the new
+    // station point -- rings return exactly when the boat stops
+    // being operator-driven.
+    Notify("XBOX_DRIVEN_" + uv, "false");
+    m_posts++;
+  }
   m_posts += 4;
   debugLog("Handback " + vname + " -> " +
            (m_handback_hold ? "hold (station)" : "autonomy"));
@@ -833,9 +1020,8 @@ void XboxJoystick::postRing(StickID sid)
     return;
 
   string lname = tolower(vname);
-  bool tagged  = (m_tagged.count(lname) > 0);
   bool has_pos = (m_vx.find(lname) != m_vx.end());
-  if(tagged || !has_pos) {
+  if(!has_pos) {
     clearRing(sid);
     return;
   }
@@ -918,8 +1104,8 @@ void XboxJoystick::clearRing(StickID sid)
 //
 // Cleared (not skipped -- no stale arrow) whenever there is no
 // commanded direction to show: stick inside deadzone, boat
-// tag-suppressed, position unknown, or (body frame) heading
-// unknown.
+// untag-dispatched (stick not commanding), position unknown, or
+// (body frame) heading unknown.
 
 void XboxJoystick::postDirTriangle(StickID sid)
 {
@@ -929,14 +1115,14 @@ void XboxJoystick::postDirTriangle(StickID sid)
     return;
 
   string lname = tolower(vname);
-  bool tag_suppressed = m_respect_tags && (m_tagged.count(lname) > 0);
   bool has_pos = (m_vx.find(lname) != m_vx.end());
 
   double mag = hypot(stk.x, stk.y);
   if(mag > 1.0)
     mag = 1.0;
 
-  if((mag < m_deadzone) || tag_suppressed || !has_pos) {
+  // No arrow while dispatched: the stick is not commanding.
+  if((mag < m_deadzone) || stk.untag_dispatch || !has_pos) {
     clearDirTriangle(sid);
     return;
   }
@@ -992,6 +1178,7 @@ void XboxJoystick::postDirTriangle(StickID sid)
   spec += ",edge_size=1";
   spec += ",vertex_size=0";
   Notify("VIEW_POLYGON", spec);
+  stk.tri_drawn = true;
   m_posts++;
 }
 
@@ -1005,6 +1192,14 @@ void XboxJoystick::postDirTriangle(StickID sid)
 
 void XboxJoystick::clearDirTriangle(StickID sid)
 {
+  // Transition-gated: posting a clear every tick while idle
+  // floods VIEW_POLYGON (~150 posts/s with the brake clears) and
+  // drowns any attempt to scope the variable -- learned the hard
+  // way while hunting the station-keep circles.
+  if(!m_stick[sid].tri_drawn)
+    return;
+  m_stick[sid].tri_drawn = false;
+
   double x = 0, y = 0;
   string vname = vehicleName(m_stick[sid].vix);
   if(vname != "") {
@@ -1033,7 +1228,7 @@ void XboxJoystick::clearDirTriangle(StickID sid)
 // Trigger-pull fill gauge: a small vertical bar just east of the
 // control ring. Drawn ONLY while the trigger is past its deadzone
 // -- no standing clutter -- and cleared under the same conditions
-// as the other graphics (released, tag-suppressed, no position).
+// as the other graphics (released, untag-dispatched, no position).
 //
 // Two stacked rectangles:
 //   *_brk_bg:   fixed outline, stick color, fill invisible --
@@ -1056,10 +1251,9 @@ void XboxJoystick::postBrakeBar(StickID sid)
     return;
 
   string lname = tolower(vname);
-  bool tag_suppressed = m_respect_tags && (m_tagged.count(lname) > 0);
   bool has_pos = (m_vx.find(lname) != m_vx.end());
 
-  if((stk.brake <= m_trigger_deadzone) || tag_suppressed || !has_pos) {
+  if((stk.brake <= m_trigger_deadzone) || stk.untag_dispatch || !has_pos) {
     clearBrakeBar(sid);
     return;
   }
@@ -1114,7 +1308,21 @@ void XboxJoystick::postBrakeBar(StickID sid)
   fl += ",edge_size=1";
   fl += ",vertex_size=0";
   Notify("VIEW_POLYGON", fl);
-  m_posts += 2;
+
+  // REV text tag under the gauge so the bar is self-explanatory
+  // (same invisible-vertex trick as the HELM tag: the label IS
+  // the text, and its (L)/(R) suffix keeps the key unique).
+  string tx;
+  tx += "x=" + doubleToStringX(x0 + m_bar_width/2.0, 2);
+  tx += ",y=" + doubleToStringX(y0 - 2.0, 2);
+  tx += ",vertex_size=1";
+  tx += ",vertex_color=invisible";
+  tx += ",label=";
+  tx += (sid == LEFT_STICK) ? "REV(L)" : "REV(R)";
+  tx += ",label_color=" + m_bar_fill_color;
+  Notify("VIEW_POINT", tx);
+  stk.bar_drawn = true;
+  m_posts += 3;
 }
 
 //---------------------------------------------------------------
@@ -1125,6 +1333,10 @@ void XboxJoystick::postBrakeBar(StickID sid)
 
 void XboxJoystick::clearBrakeBar(StickID sid)
 {
+  if(!m_stick[sid].bar_drawn)      // transition-gated, see
+    return;                        // clearDirTriangle
+  m_stick[sid].bar_drawn = false;
+
   double x = 0, y = 0;
   string vname = vehicleName(m_stick[sid].vix);
   if(vname != "") {
@@ -1144,7 +1356,149 @@ void XboxJoystick::clearBrakeBar(StickID sid)
 
   Notify("VIEW_POLYGON", base + ",label=" + lbl + "_brk_bg,active=false");
   Notify("VIEW_POLYGON", base + ",label=" + lbl + "_brk_fill,active=false");
-  m_posts += 2;
+
+  string tlbl = (sid == LEFT_STICK) ? "REV(L)" : "REV(R)";
+  Notify("VIEW_POINT", "x=" + doubleToStringX(x,2) +
+         ",y=" + doubleToStringX(y,2) + ",label=" + tlbl +
+         ",active=false");
+  m_posts += 3;
+}
+
+//---------------------------------------------------------------
+// Procedure: postHelmText
+//
+// "Under helm control" indicator: a VIEW_POINT whose vertex is
+// invisible, so the only thing that renders is its LABEL --
+// HELM(L) / HELM(R) in the stick's color, just below the ring,
+// following the boat. Deliberately the opposite trick to the
+// label_color=invisible graphics: here the label IS the payload.
+// Works on any viewer build (labels render by default), unlike
+// the newer VIEW_TEXTBOX. The label doubles as the update/clear
+// key, so it must differ per stick -- hence the (L)/(R) suffix.
+//
+// Drawn only while untag-dispatched; every code path that flips
+// the dispatch flag off calls clearHelmText(), so there is no
+// per-tick clear churn.
+
+void XboxJoystick::postHelmText(StickID sid)
+{
+  Stick &stk = m_stick[sid];
+  if(!stk.untag_dispatch)
+    return;
+
+  string vname = vehicleName(stk.vix);
+  if(vname == "")
+    return;
+  string lname = tolower(vname);
+  if(m_vx.find(lname) == m_vx.end())
+    return;
+
+  string spec;
+  spec += "x=" + doubleToStringX(m_vx[lname], 2);
+  spec += ",y=" + doubleToStringX(m_vy[lname] - (m_ring_radius + 3), 2);
+  spec += ",vertex_size=1";
+  spec += ",vertex_color=invisible";
+  spec += ",label=";
+  spec += (sid == LEFT_STICK) ? "HELM(L)" : "HELM(R)";
+  spec += ",label_color=";
+  spec += (sid == LEFT_STICK) ? m_left_ring_color : m_right_ring_color;
+  Notify("VIEW_POINT", spec);
+  m_posts++;
+}
+
+//---------------------------------------------------------------
+// Procedure: clearHelmText
+//
+// Full parseable spec + active=false, per the house lesson on
+// label-only clears.
+
+void XboxJoystick::clearHelmText(StickID sid)
+{
+  double x = 0, y = 0;
+  string vname = vehicleName(m_stick[sid].vix);
+  if(vname != "") {
+    string lname = tolower(vname);
+    if(m_vx.find(lname) != m_vx.end()) {
+      x = m_vx[lname];
+      y = m_vy[lname];
+    }
+  }
+
+  string spec;
+  spec += "x=" + doubleToStringX(x, 2);
+  spec += ",y=" + doubleToStringX(y, 2);
+  spec += ",label=";
+  spec += (sid == LEFT_STICK) ? "HELM(L)" : "HELM(R)";
+  spec += ",active=false";
+  Notify("VIEW_POINT", spec);
+  m_posts++;
+}
+
+//---------------------------------------------------------------
+// Procedure: postStickTag
+//
+// Stick-identity tag: a plain L / R in the stick's color just
+// ABOVE the ring (the HELM tag lives below it), following the
+// boat while the stick is actively driving. Cleared while untag-
+// dispatched so the boat never wears both "stick-driven" and
+// "helm-driven" text at once. Labels "L" / "R" are unique between
+// the two sticks and double as the display text.
+
+void XboxJoystick::postStickTag(StickID sid)
+{
+  Stick &stk = m_stick[sid];
+  string vname = vehicleName(stk.vix);
+  if(vname == "")
+    return;
+
+  string lname = tolower(vname);
+  bool has_pos = (m_vx.find(lname) != m_vx.end());
+  if(stk.untag_dispatch || !has_pos) {
+    clearStickTag(sid);
+    return;
+  }
+
+  string spec;
+  spec += "x=" + doubleToStringX(m_vx[lname], 2);
+  spec += ",y=" + doubleToStringX(m_vy[lname] + m_ring_radius + 3, 2);
+  spec += ",vertex_size=1";
+  spec += ",vertex_color=invisible";
+  spec += ",label=";
+  spec += (sid == LEFT_STICK) ? "L" : "R";
+  spec += ",label_color=";
+  spec += (sid == LEFT_STICK) ? m_left_ring_color : m_right_ring_color;
+  Notify("VIEW_POINT", spec);
+  stk.tag_drawn = true;
+  m_posts++;
+}
+
+//---------------------------------------------------------------
+// Procedure: clearStickTag
+
+void XboxJoystick::clearStickTag(StickID sid)
+{
+  if(!m_stick[sid].tag_drawn)      // transition-gated
+    return;
+  m_stick[sid].tag_drawn = false;
+
+  double x = 0, y = 0;
+  string vname = vehicleName(m_stick[sid].vix);
+  if(vname != "") {
+    string lname = tolower(vname);
+    if(m_vx.find(lname) != m_vx.end()) {
+      x = m_vx[lname];
+      y = m_vy[lname];
+    }
+  }
+
+  string spec;
+  spec += "x=" + doubleToStringX(x, 2);
+  spec += ",y=" + doubleToStringX(y, 2);
+  spec += ",label=";
+  spec += (sid == LEFT_STICK) ? "L" : "R";
+  spec += ",active=false";
+  Notify("VIEW_POINT", spec);
+  m_posts++;
 }
 
 //---------------------------------------------------------------
@@ -1293,7 +1647,11 @@ bool XboxJoystick::buildReport()
     string vname = vehicleName(stk.vix);
     if(vname == "")
       vname = "--";
+    else if(m_tagged.count(tolower(vname)) > 0)
+      vname += "(T)";
     string frame = stk.global_frame ? "global" : "body";
+    if(stk.untag_dispatch)
+      frame = "UNTAG";
     actab << sname << vname << frame
           << doubleToString(stk.x, 2)
           << doubleToString(stk.y, 2)
